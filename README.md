@@ -6,7 +6,7 @@ toute aide est la bienvenue :D
 je pense rajouter la récupération de l'heure par NTP pour démarrer le chauffe eau quand il n'y a pas sufisament de soleil
 je ne mets pas de led ni d'écran, les infos seront dirrectement sur home assistant
 j'utilise freetos ce qui permet d'utiliser l'esp32 sur 2 processeurs différents, l'un sur la gestion du routeur et la récupération des valeurs du compteurs sdm
-et le second sur la connection réseau/mqtt et la récetion/envoie des valeurs
+et le second sur la connection réseau/mqtt et la réception/envoie des valeurs
 
 ce qui est déja mis en place 
 l'envoie au broker mqtt des informations suivante
