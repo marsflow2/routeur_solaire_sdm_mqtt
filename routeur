@@ -1,0 +1,295 @@
+/**  marsflow routeur solaire avec sdm et mqtt
+ */
+
+#include <Arduino.h>
+#include "WiFi.h"
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <SDM.h> 
+#include "max6675.h"
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+typedef struct {
+    float voltage;
+    float current;
+    float VA;
+    float VAr;
+    float frequency;
+    float power;
+    float activeexp;
+    float activeimp;
+    float powerfactor;
+    float temp;
+} SDMData;
+
+#define WIFI_NETWORK "ssid"
+#define WIFI_PASSWORD "pass"
+#define WIFI_TIMEOUT_MS 20000 // 20 second WiFi connection timeout
+//#define WIFI_RECOVER_TIME_MS 30000 // Wait 30 seconds after a failed connection attempt
+//#define WIFI_TIMEOUT 20000 // 20 seconds
+#define MQTT_SERVER   "192.168.x.x"
+#define MQTT_PORT     1883
+#define MQTT_USER     "xxxx"
+#define MQTT_PASSWORD "xxx"
+
+const char* host     = "xxx";
+int WIFI_TIMEOUT = 0;
+
+#define SDM_RX_PIN  13
+#define SDM_TX_PIN  15
+#define SDM_UART_BAUD  4800
+//#define NOT_A_PIN 10
+
+
+#include <SoftwareSerial.h>                                                     //import SoftwareSerial library
+#if defined ( ESP8266 ) || defined ( ESP32 )                                    //for ESP
+SoftwareSerial swSerSDM;                                                        //config SoftwareSerial
+SDM sdm(swSerSDM, SDM_UART_BAUD, NOT_A_PIN, SWSERIAL_8N1, SDM_RX_PIN, SDM_TX_PIN);       //config SDM
+#else                                                                           //for AVR
+SoftwareSerial swSerSDM(SDM_RX_PIN, SDM_TX_PIN);                                //config SoftwareSerial
+SDM sdm(swSerSDM, SDM_UART_BAUD, NOT_A_PIN);                                             //config SDM
+#endif
+
+int thermoDO = 19;
+int thermoCS = 23;
+int thermoCLK = 5;
+//int thermoDO = 4;
+//int thermoCS = 5;
+//int thermoCLK = 18;
+
+
+
+
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+
+// Déclaration de la queue pour envoyer les données du compteur SDM
+#define SDM_QUEUE_LENGTH 10
+QueueHandle_t sdmQueue;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+/**
+ * Task: monitor the WiFi connection and keep it alive!
+ * 
+ * When a WiFi connection is established, this task will check it every 10 seconds 
+ * to make sure it's still alive.
+ * 
+ * If not, a reconnect is attempted. If this fails to finish within the timeout,
+ * the ESP32 will wait for it to recover and try again.
+ */
+
+// the setup function runs once when you press reset or power the board
+void setup() {
+  
+  // initialize serial communication at 115200 bits per second:
+  Serial.begin(115200);
+  sdm.begin(); 
+  connectToWiFi();  
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+sdmQueue = xQueueCreate(10, sizeof(SDMData));
+
+   xTaskCreatePinnedToCore(
+    TaskRouteur
+    ,  "TaskRouteur"   // A name just for humans
+    ,  1024  // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  NULL
+    ,  2  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+    ,  NULL 
+    ,  1);
+    //,  ARDUINO_RUNNING_CORE);
+
+
+xTaskCreatePinnedToCore(
+	WIFIMQTT,
+	"WIFIMQTT",  // Task name
+	5000,             // Stack size (bytes)
+	NULL,             // Parameter
+	1,                // Task priority
+	NULL,             // Task handle
+	0
+  );
+
+
+
+  // Now the task scheduler, which takes over control of scheduling individual tasks, is automatically started.
+}
+
+
+
+void TaskRouteur(void *pvParameters)  // This is a task.
+{
+  (void) pvParameters;
+
+
+ for (;;) // A Task shall never return or exit.
+  {
+   char bufout[10];
+  sprintf(bufout, "%c[1;0H", 27);
+  Serial.print(bufout);
+
+ Serial.print("baud:   ");
+  Serial.print(SDM_UART_BAUD);                            //display voltage
+  Serial.println("");
+  float voltage = sdm.readVal(SDM_PHASE_1_VOLTAGE);
+  float current = sdm.readVal(SDM_PHASE_1_CURRENT);
+  float VA = sdm.readVal(SDM_PHASE_1_APPARENT_POWER);
+  float VAr = sdm.readVal(SDM_PHASE_1_REACTIVE_POWER);
+  float frequency = sdm.readVal(SDM_FREQUENCY);
+  float power = sdm.readVal(SDM_PHASE_1_POWER);
+  float activeexp = sdm.readVal(SDM_EXPORT_ACTIVE_ENERGY);
+  float activeimp = sdm.readVal(SDM_IMPORT_ACTIVE_ENERGY);
+  float powerfactor = sdm.readVal(SDM_PHASE_1_POWER_FACTOR);
+  
+
+   Serial.print("Voltage:   ");
+  Serial.print(voltage);                            //display voltage
+  Serial.println("V");
+
+    Serial.print("courant:   ");
+  Serial.print(current);                            //display voltage
+  Serial.println("A");
+
+  Serial.print("Voltage Ampere:   ");
+  Serial.print(VA);                            //display voltage
+  Serial.println("VA");
+
+  Serial.print("Reactif :   ");
+  Serial.print(VAr);                            //display voltage
+  Serial.println("VAr");
+
+ Serial.print("frequence :   ");
+  Serial.print(frequency);                            //display voltage
+  Serial.println("Hz");
+
+   Serial.print("Puissance :   ");
+  Serial.print(power);                            //display voltage
+  Serial.println("W");
+  
+     Serial.print("importation :   ");
+  Serial.print(activeimp);                        //display voltage
+  Serial.println("kWh");
+
+       Serial.print("exportation :   ");
+  Serial.print(activeexp);                            //display voltage
+  Serial.println("KWh");
+
+        Serial.print("Facteur puissance :   ");
+  Serial.print(powerfactor);                            //display voltage
+  Serial.println("");
+
+
+
+Serial.println(WiFi.status());
+
+SDMData receivedData;
+    uint32_t lastTime = 0;
+    const uint32_t interval = 4900;  // 4.9 seconde d'intervalle
+    uint32_t currentTime = millis();
+
+        if (currentTime - lastTime >= interval) {
+            lastTime = currentTime;
+  float temp = thermocouple.readCelsius();
+  Serial.print("C = "); 
+   Serial.println(temp);
+
+SDMData dataToSend = {voltage, current, VA, VAr, frequency, power, activeexp, activeimp, powerfactor, temp};
+xQueueSend(sdmQueue, &dataToSend, portMAX_DELAY);
+ }
+
+
+vTaskDelay(100);  // one tick delay (15ms) in between reads for stability
+  }
+}
+
+
+
+
+void WIFIMQTT(void * parameter){
+    for(;;){
+ // Vérification de la connexion WiFi
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("Perte de connexion WiFi. Tentative de reconnexion...");
+            connectToWiFi();
+            vTaskDelay(5000); // Délai avant la prochaine vérification, pour éviter des tentatives constantes.
+            continue;
+        }
+        if (!mqttClient.connected()) {
+            connectToMQTT();
+        }
+        mqttClient.loop();
+
+SDMData receivedData;
+if(xQueueReceive(sdmQueue, &receivedData, portMAX_DELAY)) {
+
+    
+    Serial.printf("Voltage: %.2fV, Current: %.2fA, frequency: %.2fHz, Power: %.2fW, activeexp: %.2fkWh, activeimp: %.2fkWh, powerfactor: %.2f, Temp: %.2f°C\n", receivedData.voltage, receivedData.current, receivedData.frequency, receivedData.power, receivedData.activeexp, receivedData.activeimp,receivedData.powerfactor,receivedData.temp);
+
+        // Création de l'objet JSON
+        StaticJsonDocument<200> jsonDoc;
+        jsonDoc["voltage"] = receivedData.voltage;
+        jsonDoc["current"] = receivedData.current;
+        jsonDoc["frequency"] = receivedData.frequency;
+        jsonDoc["power"] = receivedData.power;
+        jsonDoc["activeexp"] = receivedData.activeexp;
+        jsonDoc["activeimp"] = receivedData.activeimp;
+        jsonDoc["powerfactor"] = receivedData.powerfactor;
+        jsonDoc["temp"] = receivedData.temp;
+
+        char mqttPayload[200];
+        serializeJson(jsonDoc, mqttPayload);
+
+        // Publiez le message MQTT
+        mqttClient.publish("sdm230/topic/value", mqttPayload);
+        
+
+
+    }
+    vTaskDelay(5000);
+}
+
+
+}
+
+
+void connectToMQTT() {
+    while (!mqttClient.connected()) {
+        Serial.print("Tentative de connexion MQTT...");
+        if (mqttClient.connect("ESP32Client", MQTT_USER, MQTT_PASSWORD)) {
+            Serial.println("connecté");
+            // Si vous voulez vous abonner à un topic :
+            // client.subscribe("some/topic");
+        } else {
+            Serial.print("échec, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" essai dans 5 secondes");
+            delay(5000);
+        }
+    }
+}
+
+void connectToWiFi() {
+    Serial.print("Tentative de connexion à ");
+    Serial.println(WIFI_NETWORK);
+
+    WiFi.begin(WIFI_NETWORK, WIFI_PASSWORD);
+
+    uint32_t startTime = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(250);
+        Serial.print(".");
+        if (millis() - startTime > WIFI_TIMEOUT_MS) {
+            Serial.println();
+            Serial.println("Echec de la connexion WiFi.");
+            return;
+        }
+    }
+    Serial.println();
+    Serial.println("Connecté avec succès.");
+}
+
+
+void loop()
+{
+  // Empty. Things are done in Tasks.
+}
